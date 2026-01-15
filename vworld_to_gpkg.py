@@ -7,6 +7,9 @@ import json
 import geopandas as gpd
 from shapely.geometry import shape
 import pandas as pd
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
 class VWorldWFSClient:
     """VWorld WFS API 클라이언트"""
@@ -14,7 +17,7 @@ class VWorldWFSClient:
     BASE_URL = "https://api.vworld.kr/req/wfs"
     
     def __init__(self):
-        self.api_key = "5A7905BA-3D09-3F70-B7DC-A01DE4C7BE2F"  # VWorld API 키
+        self.api_key = os.getenv("VWORLD_API_KEY")
     
     def get_feature_geojson(
         self,
