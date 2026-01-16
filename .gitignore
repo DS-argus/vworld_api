@@ -2,3 +2,4 @@ __pycache__/
 .cursor/
 .env
 .python-version
+.DS_Store

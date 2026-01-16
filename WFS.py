@@ -34,6 +34,14 @@ LAYERS = {
     "리": ("lt_c_adri_info", "li_cd"),
 }
 
+# EPSG:4326 (경위도, 단위 degree)
+# 요구 형태: (ymin, xmin, ymax, xmax) = (min_lat, min_lon, max_lat, max_lon)
+# bbox = (36.893900, 126.379000, 38.281700, 127.848100)
+
+# EPSG:5186 (투영좌표, 단위 meter)
+# 요구 형태: (xmin, ymin, xmax, ymax)
+# bbox = (144804.345398, 477277.335460, 274943.996015, 631272.674315)
+
 # 서울/경기도 경계 박스 (EPSG:5186 기준)
 DEFAULT_BBOX = (144693, 477383, 275745, 633107)  # (minx, miny, maxx, maxy)
 
