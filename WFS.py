@@ -2,17 +2,17 @@
 VWorld WFS API를 사용하여 행정구역 데이터를 Parquet으로 저장
 
 사용법:
-    python WFS.py                     # 전체 레이어 다운로드
-    python WFS.py --layer 시군구      # 특정 레이어만 다운로드
+    python WFS.py                    # 전체 레이어 다운로드
+    python WFS.py --layer 시군구     # 특정 레이어만 다운로드
     python WFS.py --layer 시군구 읍면동  # 여러 레이어 다운로드
-    python WFS.py --list              # 사용 가능한 레이어 목록 출력
+    python WFS.py --list             # 레이어 목록 출력
 """
 
 import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -26,194 +26,253 @@ load_dotenv()
 
 BASE_URL = "https://api.vworld.kr/req/wfs"
 API_KEY = os.getenv("VWORLD_API_KEY")
+SRSNAME = "EPSG:5186"
+PAGE_SIZE = 1000
 
-# 레이어 정의 (표시명: (API 레이어명, ID 필드))
-LAYERS = {
-    "시군구": ("lt_c_adsigg_info", "sig_cd"),
-    "읍면동": ("lt_c_ademd_info", "emd_cd"),
-    "리": ("lt_c_adri_info", "li_cd"),
+# 경기도 BBOX (EPSG:4326 경위도)
+BBOX_GYEONGGI = (126.5, 36.89, 127.90, 38.5)  # (minx, miny, maxx, maxy)
+
+
+def split_bbox(
+    bbox: Tuple[float, float, float, float], splits: int
+) -> List[Tuple[float, float, float, float]]:
+    """BBOX를 n등분 (4, 9 지원)
+
+    Args:
+        bbox: (minx, miny, maxx, maxy)
+        splits: 분할 수 (1=없음, 4=2x2, 9=3x3)
+
+    Returns:
+        분할된 BBOX 리스트
+    """
+    if splits <= 1:
+        return [bbox]
+
+    minx, miny, maxx, maxy = bbox
+
+    if splits == 4:
+        # 2x2 = 4등분
+        xs = [minx, (minx + maxx) / 2, maxx]
+        ys = [miny, (miny + maxy) / 2, maxy]
+    elif splits >= 9:
+        # 3x3 = 9등분
+        dx = (maxx - minx) / 3
+        dy = (maxy - miny) / 3
+        xs = [minx, minx + dx, minx + 2 * dx, maxx]
+        ys = [miny, miny + dy, miny + 2 * dy, maxy]
+    else:
+        return [bbox]
+
+    # 그리드 생성
+    boxes = []
+    for j in range(len(ys) - 1):
+        for i in range(len(xs) - 1):
+            boxes.append((xs[i], ys[j], xs[i + 1], ys[j + 1]))
+
+    return boxes
+
+
+# 레이어 정의
+# filters: [(column, type, value), ...] - 여러 조건 가능
+LAYERS: Dict[str, Dict[str, Any]] = {
+    "시군구": {
+        "typename": "lt_c_adsigg_info",
+        "filters": [("sig_cd", "LIKE", "41")],
+    },
+    "읍면동": {
+        "typename": "lt_c_ademd_info",
+        "filters": [("emd_cd", "LIKE", "41")],
+    },
+    "리": {
+        "typename": "lt_c_adri_info",
+        "filters": [("li_cd", "LIKE", "41")],
+    },
+    "초등학교학교군": {
+        "typename": "lt_c_desch",
+        "filters": [("edu_up_cd", "EQ", "7530000")],
+    },
+    "중학교학교군": {
+        "typename": "lt_c_dmsch",
+        "filters": [("edu_up_cd", "EQ", "7530000")],
+    },
+    "고등학교학교군": {
+        "typename": "lt_c_dhsch",
+        "filters": [("edu_up_cd", "EQ", "7530000")],
+    },
+    "교육행정구역": {
+        "typename": "lt_c_eadist",
+        "filters": [("edu_up_cd", "EQ", "7530000")],
+    },
+    "교통노드": {
+        "typename": "lt_p_moctnode",
+        "filters": [
+            ("node_type", "EQ", "106"),
+            ("ag_geom", "BBOX", BBOX_GYEONGGI),
+        ],
+        "bbox_split": 9,  # BBOX 9등분 (API 제한 우회)
+    },
+    "하천망": {
+        "typename": "lt_c_wkmstrm",
+        "filters": [
+            ("ag_geom", "BBOX", BBOX_GYEONGGI),
+        ],
+    },
 }
 
-# EPSG:4326 (경위도, 단위 degree)
-# 요구 형태: (ymin, xmin, ymax, xmax) = (min_lat, min_lon, max_lat, max_lon)
-# bbox = (36.893900, 126.379000, 38.281700, 127.848100)
 
-# EPSG:5186 (투영좌표, 단위 meter)
-# 요구 형태: (xmin, ymin, xmax, ymax)
-# bbox = (144804.345398, 477277.335460, 274943.996015, 631272.674315)
+# ============================================================
+# 필터 생성
+# ============================================================
 
-# 서울/경기도 경계 박스 (EPSG:5186 기준)
-DEFAULT_BBOX = (144693, 477383, 275745, 633107)  # (minx, miny, maxx, maxy)
 
-# STARTINDEX 최대값 (API 제한)
-MAX_STARTINDEX = 1000
+def build_condition_like(column: str, value: str) -> str:
+    """LIKE 조건 (패턴 매칭)"""
+    return (
+        f'<fes:PropertyIsLike wildCard="*" singleChar="?" escapeChar="!">'
+        f"<fes:ValueReference>{column}</fes:ValueReference>"
+        f"<fes:Literal>{value}*</fes:Literal>"
+        f"</fes:PropertyIsLike>"
+    )
+
+
+def build_condition_eq(column: str, value: str) -> str:
+    """EQ 조건 (정확히 일치)"""
+    return (
+        f"<fes:PropertyIsEqualTo>"
+        f"<fes:ValueReference>{column}</fes:ValueReference>"
+        f"<fes:Literal>{value}</fes:Literal>"
+        f"</fes:PropertyIsEqualTo>"
+    )
+
+
+def build_condition_bbox(
+    bbox: Tuple[float, float, float, float],
+    geom_column: str = "ag_geom",
+) -> str:
+    """BBOX 조건
+
+    Args:
+        bbox: (xmin, ymin, xmax, ymax) = (lon_min, lat_min, lon_max, lat_max)
+        geom_column: geometry 컬럼명
+
+    Note:
+        VWorld WFS: lowerCorner/upperCorner는 (lon lat) 순서로 사용
+    """
+    xmin, ymin, xmax, ymax = bbox  # lon_min, lat_min, lon_max, lat_max
+    return (
+        f"<fes:BBOX>"
+        f"<fes:ValueReference>{geom_column}</fes:ValueReference>"
+        f'<gml:Envelope srsName="urn:ogc:def:crs:EPSG::4326">'
+        f"<gml:lowerCorner>{xmin} {ymin}</gml:lowerCorner>"
+        f"<gml:upperCorner>{xmax} {ymax}</gml:upperCorner>"
+        f"</gml:Envelope>"
+        f"</fes:BBOX>"
+    )
+
+
+def build_filter(filters: List[Tuple]) -> Optional[str]:
+    """필터 XML 생성 (다중 조건 지원)
+
+    filters 형식:
+        - ("column", "EQ", "value")
+        - ("column", "LIKE", "value")
+        - ("geom_column", "BBOX", (minx, miny, maxx, maxy))
+    """
+    if not filters:
+        return None
+
+    conditions = []
+
+    for item in filters:
+        filter_type = item[1]
+
+        if filter_type == "EQ":
+            column, _, value = item
+            conditions.append(build_condition_eq(column, value))
+        elif filter_type == "LIKE":
+            column, _, value = item
+            conditions.append(build_condition_like(column, value))
+        elif filter_type == "BBOX":
+            geom_column, _, bbox = item
+            conditions.append(build_condition_bbox(bbox, geom_column))
+
+    if not conditions:
+        return None
+
+    # 네임스페이스
+    ns = (
+        'xmlns:fes="http://www.opengis.net/fes/2.0" '
+        'xmlns:gml="http://www.opengis.net/gml/3.2"'
+    )
+
+    # 단일 조건이면 And 없이, 다중 조건이면 And로 감싸기
+    if len(conditions) == 1:
+        return f"<fes:Filter {ns}>{conditions[0]}</fes:Filter>"
+    else:
+        inner = "".join(conditions)
+        return f"<fes:Filter {ns}><fes:And>{inner}</fes:And></fes:Filter>"
 
 
 # ============================================================
 # API 호출
 # ============================================================
 
-PAGE_SIZE = 1000  # API 최대값
 
-
-def fetch_wfs_page(
+def fetch_wfs(
     layer_name: str,
     start_index: int = 0,
-    bbox: Optional[Tuple[float, float, float, float]] = None,
-    timeout: int = 300,
+    filter_xml: Optional[str] = None,
 ) -> Optional[Dict]:
-    """
-    WFS API를 호출하여 단일 페이지의 GeoJSON 데이터 반환
-
-    Args:
-        layer_name: API 레이어명 (예: lt_c_adsigg_info)
-        start_index: 시작 인덱스 (페이지네이션용)
-        bbox: 경계 박스 (minx, miny, maxx, maxy) - EPSG:5186 기준
-        timeout: 요청 타임아웃 (초)
-
-    Returns:
-        GeoJSON 형식의 딕셔너리, 실패 시 None
-    """
+    """WFS API 호출"""
     params = {
+        "KEY": API_KEY,
         "SERVICE": "WFS",
         "VERSION": "2.0.0",
         "REQUEST": "GetFeature",
         "TYPENAME": layer_name,
-        "SRSNAME": "EPSG:5186",
+        "SRSNAME": SRSNAME,
         "OUTPUT": "application/json",
         "COUNT": PAGE_SIZE,
         "STARTINDEX": start_index,
     }
-
-    if bbox:
-        params["BBOX"] = f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]},EPSG:5186"
+    if filter_xml:
+        params["FILTER"] = filter_xml
 
     try:
-        url = f"{BASE_URL}?key={API_KEY}"
-        response = requests.get(url, params=params, timeout=timeout)
+        response = requests.get(BASE_URL, params=params, timeout=300)
         response.raise_for_status()
         return response.json()
-
+    except requests.exceptions.HTTPError as e:
+        if response.status_code in (400, 500):
+            return None
+        print(f"✗ HTTP 에러: {e}")
+        return None
     except json.JSONDecodeError:
-        print(f"\n    ✗ JSON 파싱 실패")
-        print(f"    응답 상태 코드: {response.status_code}")
-        print(f"    응답 내용 (처음 500자):\n{response.text[:500]}")
         return None
-    except requests.exceptions.RequestException as e:
-        print(f"    ✗ 요청 실패: {e}")
+    except Exception as e:
+        print(f"✗ 요청 실패: {e}")
         return None
 
 
-def split_bbox(
-    bbox: Tuple[float, float, float, float],
-    divisions: int = 2,
-) -> List[Tuple[float, float, float, float]]:
-    """
-    BBOX를 격자로 분할
-
-    Args:
-        bbox: (minx, miny, maxx, maxy)
-        divisions: 가로/세로 분할 수 (2면 4등분, 3이면 9등분)
-
-    Returns:
-        분할된 BBOX 리스트
-    """
-    minx, miny, maxx, maxy = bbox
-    width = (maxx - minx) / divisions
-    height = (maxy - miny) / divisions
-
-    boxes = []
-    for i in range(divisions):
-        for j in range(divisions):
-            box = (
-                minx + i * width,
-                miny + j * height,
-                minx + (i + 1) * width,
-                miny + (j + 1) * height,
-            )
-            boxes.append(box)
-
-    return boxes
-
-
-def fetch_wfs_bbox(
+def fetch_all_features(
     layer_name: str,
-    bbox: Tuple[float, float, float, float],
+    filter_xml: Optional[str] = None,
 ) -> List[Dict]:
-    """
-    단일 BBOX에서 페이지네이션하여 피처 수집 (최대 2000개)
-
-    Args:
-        layer_name: API 레이어명
-        bbox: 경계 박스
-
-    Returns:
-        피처 리스트
-    """
-    features = []
-    start_index = 0
-
-    while start_index <= MAX_STARTINDEX:
-        data = fetch_wfs_page(layer_name, start_index=start_index, bbox=bbox)
-
-        if not data or "features" not in data:
-            break
-
-        page_features = data["features"]
-        count = len(page_features)
-
-        if count == 0:
-            break
-
-        features.extend(page_features)
-
-        # 1000개 미만이면 마지막 페이지
-        if count < PAGE_SIZE:
-            break
-
-        start_index += PAGE_SIZE
-
-    return features
-
-
-def fetch_wfs_all(
-    layer_name: str,
-    bbox: Optional[Tuple[float, float, float, float]] = None,
-    id_field: str = "li_cd",
-) -> List[Dict]:
-    """
-    WFS API를 BBOX 분할 + 페이지네이션으로 모든 피처 수집
-
-    STARTINDEX가 1000까지만 허용되므로, BBOX를 분할하여 수집합니다.
-
-    Args:
-        layer_name: API 레이어명
-        bbox: 경계 박스
-        id_field: 중복 제거용 ID 필드명
-
-    Returns:
-        모든 피처 리스트 (중복 제거됨)
-    """
-    if not bbox:
-        bbox = DEFAULT_BBOX
-
-    # 1차 시도: 분할 없이 시도
-    print(f"    [1차 시도] 전체 영역 요청...")
+    """모든 피처 수집 (페이지네이션)"""
     all_features = []
     seen_ids = set()
-
     start_index = 0
-    page_num = 1
-    need_split = False
+    page = 1
 
-    while start_index <= MAX_STARTINDEX:
-        print(f"    - 페이지 {page_num} (startindex={start_index})...", end=" ")
-
-        data = fetch_wfs_page(layer_name, start_index=start_index, bbox=bbox)
+    while True:
+        print(f"    - 페이지 {page} (startindex={start_index})...", end=" ")
+        data = fetch_wfs(layer_name, start_index=start_index, filter_xml=filter_xml)
 
         if not data or "features" not in data:
-            # STARTINDEX 초과 에러 체크는 이미 처리됨
-            print("✗ 실패")
+            if all_features:
+                print("(API 제한, 수집 종료)")
+            else:
+                print("✗ 실패")
             break
 
         features = data["features"]
@@ -223,207 +282,172 @@ def fetch_wfs_all(
         if count == 0:
             break
 
+        # feature의 id를 중복 체크용 key로 사용
         for f in features:
-            fid = f.get("properties", {}).get(id_field)
-            if fid and fid not in seen_ids:
+            fid = f.get("id")
+            if fid is None:
+                fid = f"_idx_{len(all_features)}"
+            if fid not in seen_ids:
                 seen_ids.add(fid)
                 all_features.append(f)
 
-        # 1000개 미만이면 마지막 페이지
         if count < PAGE_SIZE:
             break
 
-        # STARTINDEX 한계에 도달하면 분할 필요
-        if start_index + PAGE_SIZE > MAX_STARTINDEX:
-            need_split = True
-            print(f"    ⚠️  STARTINDEX 한계 도달 (1000), BBOX 분할 진행...")
-            break
-
         start_index += PAGE_SIZE
-        page_num += 1
-
-    # 2차 시도: BBOX 분할
-    if need_split:
-        divisions = 3  # 9등분
-        split_boxes = split_bbox(bbox, divisions)
-        print(
-            f"    [2차 시도] BBOX를 {divisions}x{divisions}={len(split_boxes)}개로 분할"
-        )
-
-        for idx, sub_bbox in enumerate(split_boxes, 1):
-            print(f"    - 영역 {idx}/{len(split_boxes)} 처리 중...")
-
-            sub_features = fetch_wfs_bbox(layer_name, sub_bbox)
-
-            # 중복 제거하면서 추가
-            new_count = 0
-            for f in sub_features:
-                fid = f.get("properties", {}).get(id_field)
-                if fid and fid not in seen_ids:
-                    seen_ids.add(fid)
-                    all_features.append(f)
-                    new_count += 1
-
-            print(f"      ✓ {len(sub_features)}개 수집, {new_count}개 신규 추가")
+        page += 1
 
     return all_features
 
 
-# ============================================================
-# 데이터 변환
-# ============================================================
-
-
 def features_to_dataframe(features: List[Dict]) -> pd.DataFrame:
-    """
-    GeoJSON features 리스트를 DataFrame으로 변환 (geometry는 JSON 문자열로 저장)
-
-    Args:
-        features: GeoJSON features 리스트
-
-    Returns:
-        DataFrame (geometry 컬럼은 JSON 문자열)
-    """
+    """GeoJSON features -> DataFrame"""
     if not features:
         return pd.DataFrame()
 
     rows = []
-    for feature in features:
-        row = feature.get("properties", {}).copy()
-        # geometry를 JSON 문자열로 저장
-        if "geometry" in feature and feature["geometry"]:
-            row["geometry"] = json.dumps(feature["geometry"], ensure_ascii=False)
-        else:
-            row["geometry"] = None
+    for f in features:
+        row = f.get("properties", {}).copy()
+        if f.get("geometry"):
+            row["geometry"] = json.dumps(f["geometry"], ensure_ascii=False)
         rows.append(row)
 
     return pd.DataFrame(rows)
 
 
 # ============================================================
-# 메인 로직
+# 메인
 # ============================================================
 
 
 def download_layer(
     display_name: str,
-    api_layer_name: str,
-    id_field: str,
+    config: Dict[str, Any],
     output_dir: Path,
-    bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> bool:
-    """
-    단일 레이어 다운로드 및 저장 (페이지네이션 + BBOX 분할로 전체 수집)
+    """레이어 다운로드 및 저장"""
+    typename = config["typename"]
+    filters = config.get("filters", [])
+    bbox_split = config.get("bbox_split", 1)
 
-    Args:
-        display_name: 표시명 (파일명으로 사용)
-        api_layer_name: API 레이어명
-        id_field: 중복 제거용 ID 필드명
-        output_dir: 출력 디렉토리
-        bbox: 경계 박스
-
-    Returns:
-        성공 여부
-    """
     print(f"\n[{display_name}] 데이터 수집 중...")
-    print(f"  - API 레이어: {api_layer_name}")
-    print(f"  - ID 필드: {id_field}")
+    print(f"  - typename: {typename}")
 
-    # 모든 피처 수집 (BBOX 분할 + 페이지네이션)
-    all_features = fetch_wfs_all(api_layer_name, bbox=bbox, id_field=id_field)
+    # BBOX 필터 찾기 및 분할 처리
+    bbox_filter = None
+    bbox_geom_col = None
+    non_bbox_filters = []
+
+    for item in filters:
+        if item[1] == "BBOX":
+            bbox_geom_col = item[0]
+            bbox_filter = item[2]  # (minx, miny, maxx, maxy)
+        else:
+            non_bbox_filters.append(item)
+
+    # 필터 정보 출력
+    if filters:
+        filter_parts = []
+        for item in filters:
+            ftype = item[1]
+            if ftype == "BBOX":
+                geom_col, _, bbox = item
+                filter_parts.append(f"BBOX({geom_col}, {bbox})")
+            else:
+                col, _, val = item
+                filter_parts.append(f"{col} {ftype} '{val}'")
+        print(f"  - 필터: {' AND '.join(filter_parts)}")
+        if bbox_split > 1:
+            print(f"  - BBOX 분할: {bbox_split}등분")
+    else:
+        print(f"  - 필터: 없음 (전체 조회)")
+
+    # BBOX 분할 처리
+    all_features = []
+    seen_ids = set()
+
+    if bbox_filter and bbox_split > 1:
+        # BBOX를 분할해서 각각 조회
+        split_boxes = split_bbox(bbox_filter, bbox_split)
+        for i, sub_bbox in enumerate(split_boxes, 1):
+            print(f"  [영역 {i}/{len(split_boxes)}] {sub_bbox}")
+            # 분할된 BBOX로 필터 재구성
+            current_filters = non_bbox_filters + [(bbox_geom_col, "BBOX", sub_bbox)]
+            filter_xml = build_filter(current_filters)
+            features = fetch_all_features(typename, filter_xml)
+
+            # 중복 제거하며 추가
+            for f in features:
+                fid = f.get("id")
+                if fid and fid not in seen_ids:
+                    seen_ids.add(fid)
+                    all_features.append(f)
+    else:
+        # 분할 없이 일반 조회
+        filter_xml = build_filter(filters) if filters else None
+        all_features = fetch_all_features(typename, filter_xml)
 
     if not all_features:
-        print(f"    ✗ 데이터 없음")
+        print("    ✗ 데이터 없음")
         return False
 
-    # DataFrame 변환
     df = features_to_dataframe(all_features)
-    if df.empty:
-        print(f"    ✗ DataFrame 변환 실패")
-        return False
+    print(f"  ✓ 총 {len(df)}개 피처 수집")
 
-    print(f"  ✓ 총 {len(df)}개 피처 수집 완료")
-
-    # Parquet 저장
     output_file = output_dir / f"{display_name}.parquet"
     df.to_parquet(output_file, index=False)
-    print(f"  ✓ 저장 완료: {output_file}")
+    print(f"  ✓ 저장: {output_file}")
 
     return True
 
 
 def main():
-    """메인 실행 함수"""
-    # 인자 파싱
-    parser = argparse.ArgumentParser(
-        description="VWorld WFS API로 행정구역 데이터 다운로드"
-    )
-    parser.add_argument(
-        "--layer",
-        nargs="*",
-        help="다운로드할 레이어 (예: 시군구 읍면동). 지정하지 않으면 전체 다운로드",
-    )
-    parser.add_argument(
-        "--list",
-        action="store_true",
-        help="사용 가능한 레이어 목록 출력",
-    )
+    parser = argparse.ArgumentParser(description="VWorld WFS API로 데이터 다운로드")
+    parser.add_argument("--layer", nargs="*", help="레이어명")
+    parser.add_argument("--list", action="store_true", help="레이어 목록")
     args = parser.parse_args()
 
-    # 레이어 목록 출력
     if args.list:
-        print("사용 가능한 레이어:")
-        for name, (api_name, id_field) in LAYERS.items():
-            print(f"  - {name}: {api_name} (ID: {id_field})")
+        print("레이어 목록:")
+        for name, config in LAYERS.items():
+            print(f"  {name}:")
+            print(f"    - typename: {config['typename']}")
+            filters = config.get("filters", [])
+            for item in filters:
+                ftype = item[1]
+                if ftype == "BBOX":
+                    geom_col, _, bbox = item
+                    print(f"    - 필터: BBOX({geom_col}, {bbox})")
+                else:
+                    col, _, val = item
+                    print(f"    - 필터: {col} {ftype} '{val}'")
         return
 
-    print("=" * 60)
-    print("VWorld WFS API - 행정구역 데이터 다운로드")
-    print("=" * 60)
-
-    # 출력 디렉토리 생성
-    output_dir = Path(__file__).parent / "output" / "WFS"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"출력 디렉토리: {output_dir}")
-
-    # 다운로드할 레이어 결정
-    if args.layer:
-        # 지정된 레이어만
-        target_layers = {}
-        for name in args.layer:
-            if name in LAYERS:
-                target_layers[name] = LAYERS[name]
-            else:
-                print(f"⚠️  알 수 없는 레이어: {name} (--list로 목록 확인)")
-    else:
-        # 전체 레이어
-        target_layers = LAYERS
+    # 레이어 선택
+    target_layers = (
+        {n: LAYERS[n] for n in args.layer if n in LAYERS} if args.layer else LAYERS
+    )
 
     if not target_layers:
         print("다운로드할 레이어가 없습니다.")
         return
 
-    print(f"다운로드 대상: {', '.join(target_layers.keys())}")
+    print("=" * 50)
+    print("VWorld WFS - 데이터 다운로드")
+    print("=" * 50)
+    print(f"레이어: {', '.join(target_layers.keys())}")
 
-    # 각 레이어 다운로드
-    success_count = 0
-    fail_count = 0
+    output_dir = Path(__file__).parent / "output" / "WFS"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    for display_name, (api_layer_name, id_field) in target_layers.items():
-        if download_layer(
-            display_name, api_layer_name, id_field, output_dir, bbox=DEFAULT_BBOX
-        ):
-            success_count += 1
+    success = fail = 0
+    for name, config in target_layers.items():
+        if download_layer(name, config, output_dir):
+            success += 1
         else:
-            fail_count += 1
+            fail += 1
 
-    # 결과 출력
-    print(f"\n" + "=" * 60)
-    print(f"작업 완료!")
-    print(f"  성공: {success_count}개")
-    print(f"  실패: {fail_count}개")
-    print(f"  저장 경로: {output_dir}")
-    print("=" * 60)
+    print(f"\n완료! 성공: {success}, 실패: {fail}")
 
 
 if __name__ == "__main__":
