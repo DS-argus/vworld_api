@@ -14,7 +14,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
+# import pandas as pd
+import geopandas as gpd
 import requests
 from dotenv import load_dotenv
 
@@ -77,15 +78,15 @@ def split_bbox(
 LAYERS: Dict[str, Dict[str, Any]] = {
     "시군구": {
         "typename": "lt_c_adsigg_info",
-        "filters": [("sig_cd", "LIKE", "41")],
+        "filters": [("sig_cd", "LIKE", "41*")],
     },
     "읍면동": {
         "typename": "lt_c_ademd_info",
-        "filters": [("emd_cd", "LIKE", "41")],
+        "filters": [("emd_cd", "LIKE", "41*")],
     },
     "리": {
         "typename": "lt_c_adri_info",
-        "filters": [("li_cd", "LIKE", "41")],
+        "filters": [("li_cd", "LIKE", "41*")],
     },
     "초등학교학교군": {
         "typename": "lt_c_desch",
@@ -126,11 +127,16 @@ LAYERS: Dict[str, Dict[str, Any]] = {
 
 
 def build_condition_like(column: str, value: str) -> str:
-    """LIKE 조건 (패턴 매칭)"""
+    """LIKE 조건 (패턴 매칭)
+    
+    Args:
+        column: 컬럼명
+        value: 패턴 값 (와일드카드 포함 가능, 예: "41*", "*서울*", "41??")
+    """
     return (
         f'<fes:PropertyIsLike wildCard="*" singleChar="?" escapeChar="!">'
         f"<fes:ValueReference>{column}</fes:ValueReference>"
-        f"<fes:Literal>{value}*</fes:Literal>"
+        f"<fes:Literal>{value}</fes:Literal>"
         f"</fes:PropertyIsLike>"
     )
 
@@ -300,19 +306,15 @@ def fetch_all_features(
     return all_features
 
 
-def features_to_dataframe(features: List[Dict]) -> pd.DataFrame:
-    """GeoJSON features -> DataFrame"""
+def features_to_dataframe(features: List[Dict]) -> gpd.GeoDataFrame:
+    """GeoJSON features -> GeoDataFrame (공간 데이터)"""
     if not features:
-        return pd.DataFrame()
+        return gpd.GeoDataFrame()
 
-    rows = []
-    for f in features:
-        row = f.get("properties", {}).copy()
-        if f.get("geometry"):
-            row["geometry"] = json.dumps(f["geometry"], ensure_ascii=False)
-        rows.append(row)
-
-    return pd.DataFrame(rows)
+    # geopandas의 from_features를 사용하여 GeoJSON features를 직접 변환
+    # 이렇게 하면 geometry가 shapely geometry 객체로 자동 변환됨
+    gdf = gpd.GeoDataFrame.from_features(features, crs=SRSNAME)
+    return gdf
 
 
 # ============================================================
@@ -391,12 +393,13 @@ def download_layer(
         print("    ✗ 데이터 없음")
         return False
 
-    df = features_to_dataframe(all_features)
-    print(f"  ✓ 총 {len(df)}개 피처 수집")
+    gdf = features_to_dataframe(all_features)
+    print(f"  ✓ 총 {len(gdf)}개 피처 수집")
 
     output_file = output_dir / f"{display_name}.parquet"
-    df.to_parquet(output_file, index=False)
-    print(f"  ✓ 저장: {output_file}")
+    # geopandas의 to_parquet은 GeoParquet 형식으로 저장 (공간 데이터 최적화)
+    gdf.to_parquet(output_file, index=False)
+    print(f"  ✓ 저장: {output_file} (GeoParquet 형식)")
 
     return True
 
