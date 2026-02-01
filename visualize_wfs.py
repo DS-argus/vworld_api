@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import List, Optional
 
 import folium
+import geopandas as gpd
 import pandas as pd
-from pyproj import Transformer
 
 # ============================================================
 # 설정
@@ -30,94 +30,41 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 # 레이어별 스타일 (색상, 투명도)
 LAYER_STYLES = {
     "시군구": {
-        "color": "#e74c3c",
+        "color": "#000000",  # 검은색 경계
         "fill_color": "#e74c3c",
         "fill_opacity": 0.2,
-        "weight": 2,
+        "weight": 3,  # 경계선 두께 증가
     },
     "읍면동": {
-        "color": "#3498db",
+        "color": "#000000",  # 검은색 경계
         "fill_color": "#3498db",
         "fill_opacity": 0.3,
-        "weight": 1.5,
+        "weight": 2.5,  # 경계선 두께 증가
     },
     "리": {
-        "color": "#2ecc71",
+        "color": "#000000",  # 검은색 경계
         "fill_color": "#2ecc71",
         "fill_opacity": 0.4,
-        "weight": 1,
+        "weight": 2,  # 경계선 두께 증가
+    },
+    "고등학교학교군": {
+        "color": "#000000",  # 검은색 경계
+        "fill_color": "#2ecc71",
+        "fill_opacity": 0.4,
+        "weight": 2.5,  # 경계선 두께 증가
     },
 }
 
 # 기본 스타일
 DEFAULT_STYLE = {
-    "color": "#9b59b6",
+    "color": "#000000",  # 검은색 경계
     "fill_color": "#9b59b6",
     "fill_opacity": 0.3,
-    "weight": 1,
+    "weight": 2.5,  # 경계선 두께 증가
 }
 
-# 원본 좌표계 (WFS.py에서 EPSG:5186 사용)
-SOURCE_CRS = "EPSG:5186"
+# 목표 좌표계 (Folium은 WGS84 사용)
 TARGET_CRS = "EPSG:4326"
-
-
-# ============================================================
-# 좌표 변환
-# ============================================================
-
-
-def get_transformer():
-    """좌표 변환기 생성"""
-    return Transformer.from_crs(SOURCE_CRS, TARGET_CRS, always_xy=True)
-
-
-def transform_coordinates(geometry: dict, transformer: Transformer) -> dict:
-    """
-    GeoJSON geometry 좌표를 EPSG:5186에서 EPSG:4326으로 변환
-
-    Args:
-        geometry: GeoJSON geometry 딕셔너리
-        transformer: pyproj Transformer 객체
-
-    Returns:
-        변환된 GeoJSON geometry
-    """
-    geom_type = geometry.get("type")
-    coords = geometry.get("coordinates")
-
-    if not coords:
-        return geometry
-
-    def transform_point(point):
-        """단일 좌표 변환"""
-        lon, lat = transformer.transform(point[0], point[1])
-        return [lon, lat]
-
-    def transform_ring(ring):
-        """링(폴리곤의 외곽선) 변환"""
-        return [transform_point(p) for p in ring]
-
-    def transform_polygon(polygon):
-        """폴리곤 변환 (외곽선 + 홀)"""
-        return [transform_ring(ring) for ring in polygon]
-
-    if geom_type == "Point":
-        new_coords = transform_point(coords)
-    elif geom_type == "LineString":
-        new_coords = transform_ring(coords)
-    elif geom_type == "Polygon":
-        new_coords = transform_polygon(coords)
-    elif geom_type == "MultiPoint":
-        new_coords = [transform_point(p) for p in coords]
-    elif geom_type == "MultiLineString":
-        new_coords = [transform_ring(line) for line in coords]
-    elif geom_type == "MultiPolygon":
-        new_coords = [transform_polygon(poly) for poly in coords]
-    else:
-        return geometry
-
-    return {"type": geom_type, "coordinates": new_coords}
 
 
 # ============================================================
@@ -132,15 +79,15 @@ def get_available_files() -> List[str]:
     return [f.stem for f in WFS_DIR.glob("*.parquet")]
 
 
-def load_parquet(file_name: str) -> Optional[pd.DataFrame]:
+def load_parquet(file_name: str) -> Optional[gpd.GeoDataFrame]:
     """
-    Parquet 파일 로드
+    GeoParquet 파일 로드 및 CRS 변환
 
     Args:
         file_name: 파일명 (확장자 제외)
 
     Returns:
-        DataFrame 또는 None
+        GeoDataFrame (EPSG:4326) 또는 None
     """
     file_path = WFS_DIR / f"{file_name}.parquet"
 
@@ -149,9 +96,16 @@ def load_parquet(file_name: str) -> Optional[pd.DataFrame]:
         return None
 
     try:
-        df = pd.read_parquet(file_path)
-        print(f"  ✓ {file_name}: {len(df)}개 피처 로드")
-        return df
+        # GeoParquet 파일 로드
+        gdf = gpd.read_parquet(file_path)
+        print(f"  ✓ {file_name}: {len(gdf)}개 피처 로드 (CRS: {gdf.crs})")
+        
+        # CRS 변환 (Folium은 WGS84 필요)
+        if gdf.crs and gdf.crs.to_string() != TARGET_CRS:
+            print(f"    → CRS 변환: {gdf.crs} → {TARGET_CRS}")
+            gdf = gdf.to_crs(TARGET_CRS)
+        
+        return gdf
     except Exception as e:
         print(f"  ✗ 로드 실패 ({file_name}): {e}")
         return None
@@ -183,24 +137,22 @@ def create_popup_content(properties: dict, layer_name: str) -> str:
 
 def add_layer_to_map(
     m: folium.Map,
-    df: pd.DataFrame,
+    gdf: gpd.GeoDataFrame,
     layer_name: str,
-    transformer: Transformer,
 ) -> int:
     """
-    DataFrame의 geometry를 Folium 맵에 추가
+    GeoDataFrame의 geometry를 Folium 맵에 추가
 
     Args:
         m: Folium Map 객체
-        df: DataFrame (geometry 컬럼 포함)
+        gdf: GeoDataFrame (EPSG:4326)
         layer_name: 레이어 이름
-        transformer: 좌표 변환기
 
     Returns:
         추가된 피처 수
     """
-    if "geometry" not in df.columns:
-        print(f"    ⚠️  geometry 컬럼 없음")
+    if not isinstance(gdf, gpd.GeoDataFrame) or gdf.geometry is None:
+        print(f"    ⚠️  유효한 GeoDataFrame이 아님")
         return 0
 
     # 스타일 선택 (시군구_41 → 시군구 스타일 사용)
@@ -210,32 +162,26 @@ def add_layer_to_map(
     # FeatureGroup 생성 (레이어 컨트롤용)
     feature_group = folium.FeatureGroup(name=layer_name)
 
-    count = 0
-    for _, row in df.iterrows():
-        geom_str = row.get("geometry")
-        if not geom_str or pd.isna(geom_str):
-            continue
-
-        try:
-            # JSON 문자열을 딕셔너리로 변환
-            geometry = json.loads(geom_str)
-
-            # 좌표 변환 (EPSG:5186 → EPSG:4326)
-            geometry = transform_coordinates(geometry, transformer)
-
-            # 속성 추출 (geometry 제외)
-            properties = {k: v for k, v in row.items() if k != "geometry"}
-
-            # GeoJSON Feature 생성
-            feature = {
-                "type": "Feature",
-                "geometry": geometry,
-                "properties": properties,
-            }
-
+    # GeoDataFrame을 GeoJSON으로 변환
+    try:
+        geojson_data = json.loads(gdf.to_json())
+        
+        # 각 피처에 스타일과 팝업 추가
+        for feature in geojson_data.get("features", []):
+            properties = feature.get("properties", {})
+            
             # 팝업 내용 생성
             popup_html = create_popup_content(properties, layer_name)
-
+            
+            # 툴팁 텍스트 결정
+            tooltip_text = (
+                properties.get("sig_kor_nm")
+                or properties.get("emd_kor_nm")
+                or properties.get("li_kor_nm")
+                or properties.get("hakgudo_nm")
+                or layer_name
+            )
+            
             # Folium에 추가
             folium.GeoJson(
                 feature,
@@ -246,19 +192,14 @@ def add_layer_to_map(
                     "weight": s["weight"],
                 },
                 popup=folium.Popup(popup_html, max_width=300),
-                tooltip=properties.get("sig_kor_nm")
-                or properties.get("emd_kor_nm")
-                or properties.get("li_kor_nm")
-                or layer_name,
+                tooltip=tooltip_text,
             ).add_to(feature_group)
-
-            count += 1
-
-        except json.JSONDecodeError:
-            continue
-        except Exception as e:
-            print(f"    ⚠️  피처 추가 실패: {e}")
-            continue
+        
+        count = len(geojson_data.get("features", []))
+        
+    except Exception as e:
+        print(f"    ⚠️  레이어 추가 실패: {e}")
+        return 0
 
     feature_group.add_to(m)
     return count
@@ -285,24 +226,19 @@ def visualize(
     print("=" * 60)
 
     # 파일 로드
-    print("\n[1] 데이터 로드")
-    dataframes = {}
+    print("\n[1] 데이터 로드 및 CRS 변환")
+    geodataframes = {}
     for name in file_names:
-        df = load_parquet(name)
-        if df is not None:
-            dataframes[name] = df
+        gdf = load_parquet(name)
+        if gdf is not None:
+            geodataframes[name] = gdf
 
-    if not dataframes:
+    if not geodataframes:
         print("\n✗ 로드된 데이터 없음")
         return None
 
-    # 좌표 변환기 생성
-    print("\n[2] 좌표 변환기 초기화")
-    print(f"  {SOURCE_CRS} → {TARGET_CRS}")
-    transformer = get_transformer()
-
     # 지도 생성 (한국 중심)
-    print("\n[3] 지도 생성")
+    print("\n[2] 지도 생성")
     m = folium.Map(
         location=[37.5665, 126.9780],  # 서울 중심
         zoom_start=10,
@@ -310,11 +246,11 @@ def visualize(
     )
 
     # 각 레이어 추가
-    print("\n[4] 레이어 추가")
+    print("\n[3] 레이어 추가")
     total_features = 0
-    for name, df in dataframes.items():
+    for name, gdf in geodataframes.items():
         print(f"  {name} 처리 중...")
-        count = add_layer_to_map(m, df, name, transformer)
+        count = add_layer_to_map(m, gdf, name)
         total_features += count
         print(f"    → {count}개 피처 추가됨")
 
@@ -333,7 +269,7 @@ def visualize(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     m.save(str(output_path))
 
-    print(f"\n[5] 저장 완료")
+    print(f"\n[4] 저장 완료")
     print(f"  파일: {output_path}")
     print(f"  총 피처: {total_features}개")
 
