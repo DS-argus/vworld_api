@@ -104,6 +104,11 @@ LAYERS: Dict[str, Dict[str, Any]] = {
         "typename": "lt_c_eadist",
         "filters": [("edu_up_cd", "EQ", "7530000")],
     },
+    "주요상권": {
+        "typename": "lt_c_dgmainbiz",
+        "filters": [("ag_geom", "BBOX", BBOX_GYEONGGI)],
+        "bbox_split": 9,
+    },
     "교통노드": {
         "typename": "lt_p_moctnode",
         "filters": [
@@ -118,6 +123,19 @@ LAYERS: Dict[str, Dict[str, Any]] = {
             ("ag_geom", "BBOX", BBOX_GYEONGGI),
         ],
     },
+    "국립자연공원": {
+        "typename": "lt_c_wgisnpgug",
+        "filters": [],
+    },
+    "도립자연공원": {
+        "typename": "lt_c_wgisnpdo",
+        "filters": [],
+    },
+    "군립자연공원": {
+        "typename": "lt_c_wgisnpgun",
+        "filters": [],
+    }
+
 }
 
 

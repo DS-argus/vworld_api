@@ -53,6 +53,12 @@ LAYER_STYLES = {
         "fill_opacity": 0.4,
         "weight": 2.5,  # 경계선 두께 증가
     },
+    "국립자연공원": {
+        "color": "#000000",  # 검은색 경계
+        "fill_color": "#9b59b6",
+        "fill_opacity": 0.3,
+        "weight": 2.5,  # 경계선 두께 증가
+    },
 }
 
 # 기본 스타일
